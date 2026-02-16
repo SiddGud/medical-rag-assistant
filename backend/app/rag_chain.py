@@ -1,0 +1,489 @@
+import httpx
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Tuple, Optional
+from app.config import (
+    OPENROUTER_API_KEY,
+    OPENROUTER_BASE_URL,
+    LLM_MODEL,
+    HISTORY_RECENT_DAYS,
+    HISTORY_TOP_K,
+)
+from app.embeddings import get_embedding, get_embeddings
+from app.qdrant_store import (
+    search_similar,
+    search_history,
+    get_chronic_history,
+    add_history_documents,
+)
+
+logger = logging.getLogger("medical_rag")
+
+# ================= SYSTEM PROMPT (FIXED) =================
+
+SYSTEM_PROMPT = """You are a medical information assistant.
+
+KNOWLEDGE CONTROL (STRICT):
+- Medical facts, diseases, conditions, and treatments MUST come only from the provided medical knowledge.
+- Do NOT introduce new medical facts, conditions, or treatments that are not present in the context.
+
+REASONING PERMITTED:
+- You MAY use general medical reasoning to explain, summarize, or connect the provided information.
+- You MAY interpret symptoms and describe possible associations,
+  but you must NOT introduce new factual medical claims.
+
+SAFETY:
+- Do NOT provide diagnoses or treatment advice.
+- If information is incomplete, explain what can and cannot be determined.
+- Be empathetic and cautious.
+
+You are not a doctor. Encourage consulting a healthcare professional when appropriate.
+"""
+
+# ================= MAIN RAG RESPONSE =================
+
+async def generate_response(query: str, context: list[dict]) -> dict:
+    """Generate a response using OpenRouter DeepSeek R1."""
+
+    context_text = "\n\n".join([
+        f"--- Medical Information ---\n{doc['content']}"
+        for doc in context
+    ])
+
+    user_message = f"""
+You are given medical reference information and a user's question.
+
+GUIDELINES:
+- Base your answer primarily on the medical knowledge below.
+- You may apply general medical reasoning to interpret or clarify the information.
+- Do NOT introduce new medical facts, diseases, or treatments not supported by the text.
+- Do NOT provide a diagnosis or treatment plan.
+- If some details are missing, state the uncertainty clearly instead of refusing.
+
+MEDICAL KNOWLEDGE:
+{context_text}
+
+USER QUESTION:
+{query}
+
+Answer clearly, empathetically, and cautiously.
+"""
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:3000",
+        "X-Title": "Medical RAG Assistant"
+    }
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 1500
+    }
+
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            f"{OPENROUTER_BASE_URL}/chat/completions",
+            headers=headers,
+            json=payload
+        )
+
+        if response.status_code != 200:
+            error_detail = response.text
+            raise Exception(f"OpenRouter API error: {response.status_code} - {error_detail}")
+
+        result = response.json()
+        return {
+            "response": result["choices"][0]["message"]["content"],
+            "model": result.get("model", LLM_MODEL),
+            "usage": result.get("usage", {})
+        }
+
+
+# ================= SOURCE HELPERS =================
+
+def _format_sources(docs: list[dict]) -> list[dict]:
+    return [
+        {
+            "content": doc["content"][:200] + "...",
+            "condition": doc.get("metadata", {}).get("condition", "Unknown"),
+            "relevance_score": doc.get("score"),
+        }
+        for doc in docs
+    ]
+
+
+def _fallback_query_response(query: str, docs: list[dict], reason: Exception) -> dict:
+    reason_text = str(reason).strip().replace("\n", " ")
+    if len(reason_text) > 200:
+        reason_text = reason_text[:200] + "..."
+
+    if docs:
+        summary_lines = []
+        for idx, doc in enumerate(docs, start=1):
+            snippet = doc["content"].replace("\n", " ")[:220]
+            condition = doc.get("metadata", {}).get("condition", "general context")
+            summary_lines.append(f"{idx}. {snippet} (context: {condition})")
+        summary = "\n".join(summary_lines)
+    else:
+        summary = "No supporting documents were retrieved for this question."
+
+    response = "\n\n".join([
+        "The cloud reasoning model is temporarily unavailable, so I'm sharing a direct summary of the closest medical references instead.",
+        f"Reason: {reason_text or 'LLM service unavailable.'}",
+        summary,
+        "Please regard this as informational only and verify with a clinician.",
+    ])
+
+    return {
+        "response": response,
+        "sources": _format_sources(docs),
+        "model": "local-fallback",
+        "usage": {"error": reason_text or "llm_unavailable"},
+    }
+
+
+# ================= PRESCRIPTION STRUCTURING =================
+
+STRUCTURE_SYSTEM_PROMPT = """You are a medical scribe. Extract a minimal JSON summary from a prescription note.
+Fields:
+- diagnosis: list of diagnoses (strings)
+- medicines: list of medicine strings
+- is_chronic: boolean (true if chronic/long-term condition is mentioned)
+- date: ISO date string if present, else null
+- doctor_notes: brief free-text notes if present
+- raw_text: original text echoed back
+Return ONLY JSON.
+"""
+
+
+async def structure_prescription_text(raw_text: str) -> dict:
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:3000",
+        "X-Title": "Medical RAG Assistant",
+    }
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": STRUCTURE_SYSTEM_PROMPT},
+            {"role": "user", "content": raw_text},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 400,
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            f"{OPENROUTER_BASE_URL}/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+    logger.debug("Structure endpoint status: %s", response.status_code)
+
+    if response.status_code != 200:
+        raise Exception(f"OpenRouter API error: {response.status_code} - {response.text}")
+
+    import re
+
+    try:
+        result = response.json()
+        content = result["choices"][0]["message"]["content"].strip()
+
+        # Remove markdown fences if present
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?|```$", "", content, flags=re.MULTILINE).strip()
+
+        structured = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise Exception(
+            f"LLM returned non-JSON output.\nRaw content:\n{content}"
+        ) from exc
+    except Exception as exc:
+        raise Exception(f"Failed to parse LLM structuring output: {exc}") from exc
+
+    logger.debug("Structured prescription data: %s", structured)
+
+    structured.setdefault("diagnosis", [])
+    structured.setdefault("medicines", [])
+    structured.setdefault("is_chronic", False)
+    structured.setdefault("raw_text", raw_text)
+    return structured
+
+
+# ================= HISTORY HELPERS =================
+
+def _build_history_payload(patient_id: str, structured: dict, raw_text: str) -> dict:
+    date_str = structured.get("date") or datetime.now(timezone.utc).date().isoformat()
+    try:
+        dt = datetime.fromisoformat(date_str)
+    except Exception:
+        dt = datetime.now(timezone.utc)
+    payload = {
+        "content": " | ".join([
+            "Diagnoses: " + ", ".join(structured.get("diagnosis", []) or ["unknown"]),
+            "Medicines: " + ", ".join(structured.get("medicines", []) or ["unspecified"]),
+            structured.get("doctor_notes") or "",
+        ]),
+        "metadata": {
+            "patient_id": patient_id,
+            "date": dt.date().isoformat(),
+            "date_ts": dt.timestamp(),
+            "is_chronic": bool(structured.get("is_chronic", False)),
+            "type": "prescription",
+            "diagnosis": structured.get("diagnosis", []),
+            "medicines": structured.get("medicines", []),
+            "raw_text": raw_text,
+        },
+    }
+    return payload
+
+
+def _score_history_entry(entry: dict) -> float:
+    base = entry.get("score", 0.0) or 0.0
+    meta = entry.get("metadata", {})
+    if meta.get("is_chronic"):
+        base += 1.0
+    ts = meta.get("date_ts")
+    if ts:
+        days = (datetime.now(timezone.utc).timestamp() - ts) / 86400
+        if days <= 30:
+            base += 0.5
+        elif days <= HISTORY_RECENT_DAYS:
+            base += 0.2
+        else:
+            base -= 0.2
+    return base
+
+
+def _summarize_history_for_llm(history: list[dict]) -> Tuple[str, list[dict]]:
+    sorted_items = sorted(history, key=_score_history_entry, reverse=True)
+    top_items = sorted_items[:HISTORY_TOP_K]
+
+    lines = []
+    for item in top_items:
+        meta = item.get("metadata", {})
+        lines.append(
+            f"Date: {meta.get('date', 'unknown')}; Chronic: {meta.get('is_chronic', False)}; "
+            f"Diagnoses: {', '.join(meta.get('diagnosis', []))}; Medicines: {', '.join(meta.get('medicines', []))}; "
+            f"Notes: {meta.get('raw_text', '')[:200]}"
+        )
+    return "\n".join(lines), top_items
+
+
+def _fallback_history_message(symptoms: str, items: list[dict], reason: Optional[str] = None) -> str:
+    reason_text = "LLM service unavailable."
+    if reason:
+        trimmed = reason.strip().replace("\n", " ")
+        reason_text = f"LLM service unavailable ({trimmed[:180]})."
+
+    if not items:
+        history_lines = ["No structured history entries are stored for this patient yet."]
+    else:
+        history_lines = []
+        for item in items:
+            meta = item.get("metadata", {})
+            diagnoses = ", ".join(meta.get("diagnosis", [])) or "diagnosis unspecified"
+            medicines = ", ".join(meta.get("medicines", [])) or "medicines unspecified"
+            history_lines.append(
+                f"- {meta.get('date', 'unknown')}: chronic={meta.get('is_chronic', False)}; "
+                f"diagnoses={diagnoses}; medicines={medicines}"
+            )
+
+    return "\n".join([
+        reason_text,
+        f"Symptoms reported: {symptoms or 'not specified'}.",
+        "Key history signals:",
+        *history_lines,
+        "Consider validating with a clinician once the full LLM service is available."
+    ])
+
+
+# ================= HISTORY INSIGHT PROMPT (FIXED) =================
+
+HISTORY_INSIGHT_PROMPT = """You are a medical reasoning assistant.
+
+KNOWLEDGE CONTROL:
+- Medical facts, diseases, and confirmed conditions MUST come only from the provided patient history.
+- Do NOT introduce new medical facts beyond the provided information.
+
+REASONING PERMITTED:
+- You MAY use general medical reasoning to interpret symptoms.
+- You MAY identify symptom patterns and possible associations with past history.
+- Associations MUST be labeled as uncertain unless explicitly confirmed.
+
+RESTRICTIONS:
+- Do NOT provide diagnoses or treatment advice.
+- Do NOT state certainty without explicit evidence.
+
+TASK:
+1. List observed facts from the history and symptoms.
+2. Describe possible associations using cautious language.
+3. Label evidence strength as strong, moderate, or weak.
+4. Explicitly state uncertainties and missing information.
+
+STYLE:
+- Clinical, cautious, and non-alarmist.
+- Use phrases like "may be associated", "could be related", "cannot be determined with certainty".
+
+End with a brief disclaimer encouraging clinical review.
+"""
+
+
+async def generate_history_insight(symptoms: str, history: list[dict]) -> dict:
+    history_text, used_items = _summarize_history_for_llm(history)
+    user_message = f"""Current symptoms: {symptoms}
+
+Relevant history:
+{history_text}
+
+Provide a history-based medical insight (not a diagnosis)."""
+
+    if not OPENROUTER_API_KEY:
+        return {
+            "response": _fallback_history_message(symptoms, used_items, "missing OPENROUTER_API_KEY"),
+            "model": "local-fallback",
+            "usage": {"error": "openrouter_api_key_missing"},
+            "history_used": used_items,
+        }
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:3000",
+        "X-Title": "Medical RAG Assistant",
+    }
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": HISTORY_INSIGHT_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 700,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{OPENROUTER_BASE_URL}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+        result = response.json()
+        return {
+            "response": result["choices"][0]["message"]["content"],
+            "model": result.get("model", LLM_MODEL),
+            "usage": result.get("usage", {}),
+            "history_used": used_items,
+        }
+    except Exception as exc:
+        reason = str(exc)
+        return {
+            "response": _fallback_history_message(symptoms, used_items, reason),
+            "model": "local-fallback",
+            "usage": {"error": reason[:200]},
+            "history_used": used_items,
+        }
+
+
+# ================= INGESTION & QUERY =================
+
+async def ingest_prescription_text(patient_id: str, raw_text: str) -> Tuple[dict, int]:
+    logger.debug("Raw prescription text for patient %s: %s", patient_id, raw_text)
+    structured = await structure_prescription_text(raw_text)
+    payload = _build_history_payload(patient_id, structured, raw_text)
+    embedding = get_embeddings([payload["content"]])[0]
+    stored = add_history_documents([payload], [embedding])
+    return structured, stored
+
+
+async def query_rag(query: str, top_k: int = 3) -> dict:
+    query_embedding = get_embedding(query)
+    relevant_docs = search_similar(query_embedding, limit=top_k)
+
+    if not relevant_docs:
+        return {
+            "response": "I don't have enough medical information to answer your question. Please consult a healthcare professional.",
+            "sources": [],
+            "model": LLM_MODEL
+        }
+
+    try:
+        llm_result = await generate_response(query, relevant_docs)
+        return {
+            "response": llm_result["response"],
+            "sources": _format_sources(relevant_docs),
+            "model": llm_result["model"],
+            "usage": llm_result.get("usage", {}),
+        }
+    except Exception as exc:
+        return _fallback_query_response(query, relevant_docs, exc)
+
+
+async def ingest_audio_symptom(patient_id: str, transcript: str) -> int:
+    payload = {
+        "content": transcript,
+        "metadata": {
+            "patient_id": patient_id,
+            "type": "audio_symptom",
+            "date": datetime.now(timezone.utc).date().isoformat(),
+            "date_ts": datetime.now(timezone.utc).timestamp(),
+            "raw_text": transcript,
+            "is_chronic": False,
+        },
+    }
+
+    embedding = get_embeddings([transcript])[0]
+    stored = add_history_documents([payload], [embedding])
+    return stored
+
+
+async def query_history_correlation(patient_id: str, symptoms: str, top_k: int = HISTORY_TOP_K) -> dict:
+    symptom_embedding = get_embedding(symptoms)
+
+    similar = search_history(patient_id, symptom_embedding, limit=top_k + 4)
+    chronic = get_chronic_history(patient_id)
+
+    def _identity(item: dict) -> tuple:
+        meta = item.get("metadata", {})
+        return (item.get("content"), meta.get("date"), meta.get("raw_text"))
+
+    seen = {_identity(item) for item in similar}
+    combined = similar + [item for item in chronic if _identity(item) not in seen]
+    if not combined:
+        return {
+            "response": "No prior history found for this patient to correlate with current symptoms.",
+            "sources": [],
+            "model": LLM_MODEL,
+        }
+
+    llm_result = await generate_history_insight(symptoms, combined)
+
+    return {
+        "response": llm_result["response"],
+        "sources": [
+            {
+                "summary": item.get("content", "")[:200],
+                "date": item.get("metadata", {}).get("date"),
+                "is_chronic": item.get("metadata", {}).get("is_chronic", False),
+                "type": item.get("metadata", {}).get("type"),
+                "score": _score_history_entry(item),
+                "raw_text": item.get("metadata", {}).get("raw_text"),
+            }
+            for item in llm_result["history_used"]
+        ],
+        "model": llm_result["model"],
+        "usage": llm_result.get("usage", {}),
+    }
