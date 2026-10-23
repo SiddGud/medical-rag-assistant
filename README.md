@@ -1,5 +1,13 @@
 # Medical RAG Assistant
 
+<p align="left">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"/></a>
+  <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg" alt="Python 3.10+"/>
+  <img src="https://img.shields.io/badge/React-18-61dafb.svg" alt="React 18"/>
+  <img src="https://img.shields.io/badge/Vector_DB-Qdrant-red.svg" alt="Qdrant"/>
+  <img src="https://img.shields.io/badge/Status-Maintained-success.svg" alt="Maintained"/>
+</p>
+
 A Retrieval Augmented Generation (RAG) assistant that combines a FastAPI backend, in-memory Qdrant vector search, and a Vite + React frontend to surface medical reference information, store structured patient history, and accept speech or prescription uploads. Use it as an internal prototype, not as medical advice.
 
 ## Features
